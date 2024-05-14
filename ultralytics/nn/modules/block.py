@@ -9,7 +9,7 @@ from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
 from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
-           'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ResNetLayer')
+           'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3', 'ResNetLayer','ConvModule','C2fRes')
 
 
 class DFL(nn.Module):
@@ -183,7 +183,35 @@ class C2(nn.Module):
         a, b = self.cv1(x).chunk(2, 1)
         return self.cv2(torch.cat((self.m(a), b), 1))
 
+class Bottleneck(nn.Module):
+    # Bottleneck 模块定义
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):
+        super(Bottleneck, self).__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_, c2, 3, 1, 1, g=g)
+        self.add = shortcut and c1 == c2
 
+    def forward(self, x):
+        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+class C2fRes(nn.Module):
+    """CSP Bottleneck with 2 convolutions and a residual connection, with improved residual connection handling."""
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        super().__init__()
+        self.c = int(c2 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList([Bottleneck(self.c, self.c, shortcut, g, e=1.0) for _ in range(n)])
+        # Improved residual connection
+        self.residual = Conv(c1, c2, 1, 1) if c1 != c2 else nn.Identity()
+
+    def forward(self, x):
+        residual = self.residual(x)
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend([m(y[-1]) for m in self.m])
+        y = self.cv2(torch.cat(y, 1))
+        return y + residual
 class C2f(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
@@ -401,7 +429,7 @@ class ChannelGate(nn.Module):
         if y.size(0) > 1:
             y = self.bn(y)  # 对卷积层的输出应用批归一化
         y = y.view(b, c, 1, 1)  # 展平特征图以输入全连接层
-        print(y.shape)
+        # print(y.shape)
         # 使用expand_as方法将权重向量广播到与输入特征图相同的形状，并返回结果
         return y.expand_as(x)
 
@@ -459,3 +487,26 @@ class BAM(nn.Module):
 
         # 将注意力权重与输入特征图相乘，并加上原始特征图，实现注意力机制的效果
         return x + x * attn
+
+
+class ConvModule(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+        super(ConvModule, self).__init__()
+
+        # 定义卷积层
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+
+        # 定义批量归一化层
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        # 卷积
+        x = self.conv(x)
+
+        # 批量归一化
+        x = self.bn(x)
+
+        # SiLU激活函数
+        x = F.silu(x)
+
+        return x
